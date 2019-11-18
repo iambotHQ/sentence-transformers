@@ -2,6 +2,9 @@
 This files contains various pytorch dataset classes, that provide
 data to the Transformer model
 """
+from functools import partial
+from multiprocessing.pool import Pool
+
 from torch.utils.data import Dataset
 from typing import List
 from torch import Tensor
@@ -49,29 +52,22 @@ class SentencesDataset(Dataset):
             for the DataLoader
         """
         num_texts = len(examples[0].texts)
-        inputs = [[] for _ in range(num_texts)]
-        labels = []
+
         too_long = [0] * num_texts
-        label_type = None
         iterator = examples
         if self.show_progress_bar:
             iterator = tqdm(iterator, desc="Convert dataset")
 
-        for ex_index, example in enumerate(iterator):
-            if label_type is None:
-                if isinstance(example.label, int):
-                    label_type = torch.long
-                elif isinstance(example.label, float):
-                    label_type = torch.float
-            tokenized_texts = [model.tokenize(text) for text in example.texts]
+        with Pool() as pool:
+            inputs = pool.map(partial(self._convert_example, model=model), iterator)
+            inputs = np.array(inputs).T
 
-            for i, token in enumerate(tokenized_texts):
-                if hasattr(model, 'max_seq_length') and model.max_seq_length is not None and model.max_seq_length > 0 and len(token) >= model.max_seq_length:
-                    too_long[i] += 1
+        if hasattr(model, 'max_seq_length') and model.max_seq_length is not None:
+            is_seq_too_long = np.vectorize(lambda tokens: len(tokens) >= model.max_seq_length)
+            too_long = is_seq_too_long(inputs).sum(axis=0)
 
-            labels.append(example.label)
-            for i in range(num_texts):
-                inputs[i].append(tokenized_texts[i])
+        labels = [example.label for example in examples]
+        label_type = {int: torch.long, float: torch.float}.get(type(examples[0].label))
 
         tensor_labels = torch.tensor(labels, dtype=label_type)
 
@@ -81,6 +77,10 @@ class SentencesDataset(Dataset):
 
         self.tokens = inputs
         self.labels = tensor_labels
+
+    @staticmethod
+    def _convert_example(example: InputExample, model: SentenceTransformer):
+        return [model.tokenize(text) for text in example.texts]
 
     def __getitem__(self, item):
         return [self.tokens[i][item] for i in range(len(self.tokens))], self.labels[item]
