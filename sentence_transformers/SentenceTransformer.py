@@ -277,6 +277,9 @@ class SentenceTransformer(nn.Sequential):
         for loss_model in loss_models:
             loss_model.to(device)
 
+        if torch.cuda.device_count() > 1:
+            loss_models = [torch.nn.DataParallel(loss_model) for loss_model in loss_models]
+
         self.best_score = -9999
 
         min_batch_size = min([len(dataloader) for dataloader in dataloaders])
@@ -342,6 +345,9 @@ class SentenceTransformer(nn.Sequential):
 
                 features, labels = batch_to_device(data, self.device)
                 loss_value = loss_model(features, labels)
+
+                if torch.cuda.device_count() > 1:
+                    loss_value = loss_value.mean()
 
                 if fp16:
                     with amp.scale_loss(loss_value, optimizer) as scaled_loss:
