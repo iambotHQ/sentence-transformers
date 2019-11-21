@@ -1,89 +1,120 @@
-"""
-This script trains sentence transformers with a triplet loss function.
-
-As corpus, we use the wikipedia sections dataset that was describd by Dor et al., 2018, Learning Thematic Similarity Metric Using Triplet Networks.
-
-See docs/pretrained-models/wikipedia-sections-modesl.md for further details.
-
-You can get the dataset by running examples/datasets/get_data.py
-"""
-import torch
-
-from sentence_transformers import SentenceTransformer, SentencesDataset, LoggingHandler, losses, \
-    models
-from torch.utils.data import DataLoader
-from torch.multiprocessing import set_start_method
-from sentence_transformers.readers import TripletReader
-from sentence_transformers.evaluation import TripletEvaluator
-from datetime import datetime
-
+import argparse
 import csv
 import logging
+from datetime import datetime
+
+import torch
+from torch.multiprocessing import set_start_method
+from torch.utils.data import DataLoader, DistributedSampler
+
+import sentence_transformers as st
+from sentence_transformers.evaluation import TripletEvaluator
+from sentence_transformers.readers import TripletReader
 
 logging.basicConfig(format='%(asctime)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     level=logging.INFO,
-                    handlers=[LoggingHandler()])
+                    handlers=[st.LoggingHandler()])
 
-try:
-    set_start_method('spawn')
-except RuntimeError:
-    pass
 
-if __name__ == '__main__':
-    # Create a torch.DataLoader that passes training batch instances to our model
-    cuda_batch_size_multiplier = max(torch.cuda.device_count(), 1)
-    train_batch_size = 16 * cuda_batch_size_multiplier
-    triplet_reader = TripletReader('examples/datasets/iambot-wikipedia-sections-triplets',
+def get_triplet_dataset(dataset_dir: str, csv_file: str, model: st.SentenceTransformer,
+                        max_examples=0) -> st.SentencesDataset:
+    triplet_reader = TripletReader(dataset_dir,
                                    s1_col_idx=0, s2_col_idx=1, s3_col_idx=2, delimiter=',',
                                    quoting=csv.QUOTE_MINIMAL, has_header=True)
-    output_path = "output/bert-base-wikipedia-sections-mean-tokens-" + datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S")
+
+    return st.SentencesDataset(examples=triplet_reader.get_examples(csv_file, max_examples),
+                               model=model)
+
+
+def get_data_loader(dataset: st.SentencesDataset, shuffle: bool,
+                    batch_size: int, distributed=False) -> DataLoader:
+    return DataLoader(dataset,
+                      shuffle=shuffle if not distributed else False,
+                      batch_size=batch_size,
+                      sampler=DistributedSampler(dataset) if distributed else None)
+
+
+def get_model(local_rank=0) -> st.SentenceTransformer:
+    word_embedding_model: st.BERT = st.models.BERT('bert-base-uncased')
+    pooling_model = st.models.Pooling(word_embedding_model.get_word_embedding_dimension(),
+                                      pooling_mode_mean_tokens=True,
+                                      pooling_mode_cls_token=False,
+                                      pooling_mode_max_tokens=False)
+    return st.SentenceTransformer(modules=[word_embedding_model, pooling_model],
+                                  local_rank=local_rank)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--local_rank', type=int, default=-1)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    dataset_path = 'examples/datasets/iambot-wikipedia-sections-triplets'
+
+    output_path = 'output/bert-base-wikipedia-sections-mean-tokens-' + \
+                  datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+
+    batch_size = 16
     num_epochs = 1
 
-    # Configure sentence transformers for training and train on the provided dataset
-    # Use BERT for mapping tokens to embeddings
-    word_embedding_model = models.BERT('bert-base-uncased')
+    is_distributed = torch.cuda.device_count() > 1
 
-    # Apply mean pooling to get one fixed sized sentence vector
-    pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(),
-                                   pooling_mode_mean_tokens=True,
-                                   pooling_mode_cls_token=False,
-                                   pooling_mode_max_tokens=False)
+    if is_distributed:
+        torch.distributed.init_process_group(backend='nccl')
 
-    model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+    model = get_model(local_rank=args.local_rank)
 
-    logging.info("Read Triplet train dataset")
-    train_data = SentencesDataset(examples=triplet_reader.get_examples('train.csv'), model=model)
-    train_dataloader = DataLoader(train_data, shuffle=True, batch_size=train_batch_size,
-                                  num_workers=cuda_batch_size_multiplier)
-    train_loss = losses.TripletLoss(model=model)
+    logging.info('Read Triplet train dataset')
+    train_data = get_triplet_dataset(dataset_path, 'train.csv', model)
+    train_dataloader = get_data_loader(
+        dataset=train_data,
+        shuffle=True,
+        batch_size=batch_size,
+        distributed=is_distributed)
 
-    logging.info("Read Wikipedia Triplet dev dataset")
-    dev_data = SentencesDataset(examples=triplet_reader.get_examples('validation.csv', 1000),
-                                model=model)
-    dev_dataloader = DataLoader(dev_data, shuffle=False, batch_size=train_batch_size)
+    logging.info('Read Wikipedia Triplet dev dataset')
+    dev_dataloader = get_data_loader(
+        dataset=get_triplet_dataset(dataset_path, 'validation.csv', model, 1000),
+        shuffle=False,
+        batch_size=batch_size,
+        distributed=is_distributed
+    )
     evaluator = TripletEvaluator(dev_dataloader)
 
-    warmup_steps = int(len(train_data) * num_epochs / train_batch_size * 0.1)  # 10% of train data
+    warmup_steps = int(len(train_data) * num_epochs / batch_size * 0.1)
 
-    # Train the model
-    model.fit(train_objectives=[(train_dataloader, train_loss)],
+    loss = st.losses.TripletLoss(model=model)
+
+    model.fit(train_objectives=[(train_dataloader, loss)],
               evaluator=evaluator,
               epochs=num_epochs,
               evaluation_steps=1000,
               warmup_steps=warmup_steps,
-              output_path=output_path)
+              output_path=output_path,
+              local_rank=args.local_rank)
 
-    ##############################################################################
-    #
-    # Load the stored model and evaluate its performance on STS benchmark dataset
-    #
-    ##############################################################################
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    model = SentenceTransformer(output_path)
-    test_data = SentencesDataset(examples=triplet_reader.get_examples('test.csv'), model=model)
-    test_dataloader = DataLoader(test_data, shuffle=False, batch_size=train_batch_size)
-    evaluator = TripletEvaluator(test_dataloader)
+    if args.local_rank == 0 or not is_distributed:
+        model = st.SentenceTransformer(output_path)
+        test_data = get_triplet_dataset(dataset_path, 'test.csv', model)
+        test_dataloader = get_data_loader(test_data, shuffle=False, batch_size=batch_size)
+        evaluator = TripletEvaluator(test_dataloader)
 
-    model.evaluate(evaluator)
+        model.evaluate(evaluator)
+
+
+if __name__ == '__main__':
+    try:
+        set_start_method('spawn')
+    except RuntimeError:
+        pass
+
+    main()

@@ -11,6 +11,7 @@ import pytorch_transformers
 import torch
 from numpy import ndarray
 from torch import nn, Tensor
+from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
@@ -20,8 +21,9 @@ from .evaluation import SentenceEvaluator
 from .util import import_from_string, batch_to_device, http_get
 from . import __version__
 
+
 class SentenceTransformer(nn.Sequential):
-    def __init__(self, model_name_or_path: str = None, modules: Iterable[nn.Module] = None, device: str = None):
+    def __init__(self, model_name_or_path: str = None, modules: Iterable[nn.Module] = None, device: str = None, local_rank=0):
         if modules is not None and not isinstance(modules, OrderedDict):
             modules = OrderedDict([(str(idx), module) for idx, module in enumerate(modules)])
 
@@ -46,7 +48,6 @@ class SentenceTransformer(nn.Sequential):
                 default_cache_path = os.path.join(torch_cache_home, 'sentence_transformers')
                 model_path = os.path.join(default_cache_path, folder_name)
                 os.makedirs(model_path, exist_ok=True)
-
 
                 if not os.listdir(model_path):
                     if model_url[-1] is "/":
@@ -75,13 +76,17 @@ class SentenceTransformer(nn.Sequential):
                     module = module_class.load(os.path.join(model_path, module_config['path']))
                     modules[module_config['name']] = module
 
-
         super().__init__(modules)
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logging.info("Use pytorch device: {}".format(device))
-        self.device = torch.device(device)
-        self.to(device)
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda', max(local_rank, 0))
+            else:
+                self.device = torch.device('cpu')
+        else:
+            self.device = torch.device(device)
+
+        logging.info("Use pytorch device: {}".format(self.device))
+        self.to(self.device)
 
     def encode(self, sentences: List[str], batch_size: int = 8, show_progress_bar: bool = None) -> List[ndarray]:
         """
@@ -218,8 +223,6 @@ class SentenceTransformer(nn.Sequential):
 
         return {'features': features, 'labels': torch.stack(labels)}
 
-
-
     def fit(self,
             train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
             evaluator: SentenceEvaluator,
@@ -273,12 +276,17 @@ class SentenceTransformer(nn.Sequential):
             dataloader.collate_fn = self.smart_batching_collate
 
         loss_models = [loss for _, loss in train_objectives]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for loss_model in loss_models:
-            loss_model.to(device)
+            loss_model.to(self.device)
 
         if torch.cuda.device_count() > 1:
-            loss_models = [torch.nn.DataParallel(loss_model) for loss_model in loss_models]
+            loss_models = [
+                DistributedDataParallel(module=model,
+                                        device_ids=[local_rank],
+                                        output_device=local_rank,
+                                        find_unused_parameters=True)
+                for model in loss_models
+            ]
 
         self.best_score = -9999
 
@@ -345,9 +353,6 @@ class SentenceTransformer(nn.Sequential):
 
                 features, labels = batch_to_device(data, self.device)
                 loss_value = loss_model(features, labels)
-
-                if torch.cuda.device_count() > 1:
-                    loss_value = loss_value.mean()
 
                 if fp16:
                     with amp.scale_loss(loss_value, optimizer) as scaled_loss:

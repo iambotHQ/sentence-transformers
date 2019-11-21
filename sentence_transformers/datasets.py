@@ -4,7 +4,6 @@ data to the Transformer model
 """
 from functools import partial
 from multiprocessing.pool import Pool
-
 from torch.utils.data import Dataset
 from typing import List
 from torch import Tensor
