@@ -4,8 +4,10 @@ data to the Transformer model
 """
 from functools import partial
 from multiprocessing.pool import Pool
+from pathlib import Path
+
 from torch.utils.data import Dataset
-from typing import List
+from typing import List, Iterable
 from torch import Tensor
 import bisect
 import torch
@@ -26,7 +28,10 @@ class SentencesDataset(Dataset):
     tokens: List[List[List[str]]]
     labels: Tensor
 
-    def __init__(self, examples: List[InputExample], model: SentenceTransformer, show_progress_bar: bool = None):
+    CONVERTED_INPUTS_DUMP = Path('.dataset-cache/inputs.pt')
+    CONVERTED_LABELS_DUMP = Path('.dataset-cache/labels.pt')
+
+    def __init__(self, examples: Iterable[InputExample], model: SentenceTransformer, show_progress_bar: bool = None):
         """
         Create a new SentencesDataset with the tokenized texts and the labels as Tensor
         """
@@ -34,9 +39,13 @@ class SentencesDataset(Dataset):
             show_progress_bar = (logging.getLogger().getEffectiveLevel() == logging.INFO or logging.getLogger().getEffectiveLevel() == logging.DEBUG)
         self.show_progress_bar = show_progress_bar
 
-        self.convert_input_examples(examples, model)
+        if not self.CONVERTED_INPUTS_DUMP.exists() or not self.CONVERTED_LABELS_DUMP:
+            self.convert_input_examples(examples, model)
+        else:
+            self.tokens = torch.load(self.CONVERTED_INPUTS_DUMP)
+            self.labels = torch.load(self.CONVERTED_LABELS_DUMP)
 
-    def convert_input_examples(self, examples: List[InputExample], model: SentenceTransformer):
+    def convert_input_examples(self, examples: Iterable[InputExample], model: SentenceTransformer):
         """
         Converts input examples to a SmartBatchingDataset usable to train the model with
         SentenceTransformer.smart_batching_collate as the collate_fn for the DataLoader
@@ -50,6 +59,7 @@ class SentencesDataset(Dataset):
         :return: a SmartBatchingDataset usable to train the model with SentenceTransformer.smart_batching_collate as the collate_fn
             for the DataLoader
         """
+        examples = list(examples)
         num_texts = len(examples[0].texts)
 
         too_long = [0] * num_texts
@@ -76,6 +86,10 @@ class SentencesDataset(Dataset):
 
         self.tokens = inputs
         self.labels = tensor_labels
+
+        self.CONVERTED_INPUTS_DUMP.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.tokens, self.CONVERTED_INPUTS_DUMP)
+        torch.save(self.labels, self.CONVERTED_LABELS_DUMP)
 
     @staticmethod
     def _convert_example(example: InputExample, model: SentenceTransformer):

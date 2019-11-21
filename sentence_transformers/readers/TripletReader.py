@@ -24,7 +24,7 @@ class TripletReader(object):
         """
         data = csv.reader(open(os.path.join(self.dataset_folder, filename), encoding="utf-8"), delimiter=self.delimiter,
                           quoting=self.quoting)
-        examples = []
+        current_examples = 0
         if self.has_header:
             next(data)
 
@@ -33,8 +33,7 @@ class TripletReader(object):
             s2 = row[self.s2_col_idx]
             s3 = row[self.s3_col_idx]
 
-            examples.append(InputExample(guid=filename+str(id), texts=[s1, s2, s3], label=1))
-            if max_examples > 0 and len(examples) >= max_examples:
+            yield InputExample(guid=filename + str(id), texts=[s1, s2, s3], label=1)
+            current_examples += 1
+            if max_examples > 0 and current_examples >= max_examples:
                 break
-
-        return examples

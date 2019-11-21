@@ -369,13 +369,14 @@ class SentenceTransformer(nn.Sequential):
                 optimizer.zero_grad()
                 global_step += 1
 
-                if evaluation_steps > 0 and training_steps % evaluation_steps == 0:
+                if evaluation_steps > 0 and training_steps % evaluation_steps == 0 and local_rank <= 0:
                     self._eval_during_training(evaluator, output_path, save_best_model, epoch, training_steps)
                     for loss_model in loss_models:
                         loss_model.zero_grad()
                         loss_model.train()
 
-            self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1)
+            if local_rank <= 0:
+                self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1)
 
     def evaluate(self, evaluator: SentenceEvaluator, output_path: str = None):
         """

@@ -62,7 +62,7 @@ def main():
     batch_size = 16
     num_epochs = 1
 
-    is_distributed = torch.cuda.device_count() > 1
+    is_distributed = torch.cuda.device_count() > 1 and args.local_rank >= 0
 
     if is_distributed:
         torch.distributed.init_process_group(backend='nccl')
