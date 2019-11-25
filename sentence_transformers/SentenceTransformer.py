@@ -279,7 +279,7 @@ class SentenceTransformer(nn.Sequential):
         for loss_model in loss_models:
             loss_model.to(self.device)
 
-        if torch.cuda.device_count() > 1:
+        if torch.cuda.device_count() > 1 and local_rank >= 0:
             loss_models = [
                 DistributedDataParallel(module=model,
                                         device_ids=[local_rank],

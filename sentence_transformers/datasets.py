@@ -2,10 +2,13 @@
 This files contains various pytorch dataset classes, that provide
 data to the Transformer model
 """
+import sys
 from functools import partial
+from itertools import tee
 from multiprocessing.pool import Pool
 from pathlib import Path
 
+import tables
 from torch.utils.data import Dataset
 from typing import List, Iterable
 from torch import Tensor
@@ -25,13 +28,18 @@ class SentencesDataset(Dataset):
     The SentenceBertEncoder.smart_batching_collate is required for this to work.
     SmartBatchingDataset does *not* work without it.
     """
-    tokens: List[List[List[str]]]
+    tokens: np.ndarray
     labels: Tensor
 
-    CONVERTED_INPUTS_DUMP = Path('.dataset-cache/inputs.pt')
-    CONVERTED_LABELS_DUMP = Path('.dataset-cache/labels.pt')
+    _label_type_mapping = {
+        int: torch.long,
+        np.int64.__class__: torch.long,
+        np.uint8.__class__: torch.long,
+        float: torch.float,
+    }
 
-    def __init__(self, examples: Iterable[InputExample], model: SentenceTransformer, show_progress_bar: bool = None):
+    def __init__(self, examples: Iterable[InputExample], model: SentenceTransformer,
+                 dataset_cache_id=None, show_progress_bar: bool = None):
         """
         Create a new SentencesDataset with the tokenized texts and the labels as Tensor
         """
@@ -39,13 +47,10 @@ class SentencesDataset(Dataset):
             show_progress_bar = (logging.getLogger().getEffectiveLevel() == logging.INFO or logging.getLogger().getEffectiveLevel() == logging.DEBUG)
         self.show_progress_bar = show_progress_bar
 
-        if not self.CONVERTED_INPUTS_DUMP.exists() or not self.CONVERTED_LABELS_DUMP:
-            self.convert_input_examples(examples, model)
-        else:
-            self.tokens = torch.load(self.CONVERTED_INPUTS_DUMP)
-            self.labels = torch.load(self.CONVERTED_LABELS_DUMP)
+        self.convert_input_examples(examples, model, dataset_cache_id)
 
-    def convert_input_examples(self, examples: Iterable[InputExample], model: SentenceTransformer):
+    def convert_input_examples(self, examples: Iterable[InputExample], model: SentenceTransformer,
+                               dataset_cache_id: str, cache_dir=Path('.cache')):
         """
         Converts input examples to a SmartBatchingDataset usable to train the model with
         SentenceTransformer.smart_batching_collate as the collate_fn for the DataLoader
@@ -56,50 +61,103 @@ class SentencesDataset(Dataset):
             the input examples for the training
         :param model
             the Sentence BERT model for the conversion
+        :param cache_dir:
+            directory where tokenized dataset is cached
+        :param dataset_cache_id:
+            dataset identifier as cache file name
         :return: a SmartBatchingDataset usable to train the model with SentenceTransformer.smart_batching_collate as the collate_fn
             for the DataLoader
         """
-        examples = list(examples)
-        num_texts = len(examples[0].texts)
 
-        too_long = [0] * num_texts
-        iterator = examples
+        dataset_h5_cache = cache_dir / dataset_cache_id / 'cache.h5'
+        tokens_array = 'tokens'
+        labels_array = 'labels'
+
+        if dataset_h5_cache.exists():
+            self.read_h5_dataset(dataset_h5_cache, labels_array, tokens_array)
+            return
+
+        examples_iter1, examples_iter2 = tee(examples)
+
         if self.show_progress_bar:
-            iterator = tqdm(iterator, desc="Convert dataset")
+            examples_iter1 = tqdm(examples_iter1, desc='Convert dataset')
+            examples_iter2 = tqdm(examples_iter2, desc='Convert labels')
 
         with Pool() as pool:
-            inputs = pool.map(partial(self._convert_example, model=model), iterator)
-            inputs = np.array(inputs).T
+            tokens_iter1, tokens_iter2 = tee(
+                pool.imap(
+                    func=partial(self._convert_example, model=model),
+                    iterable=examples_iter1,
+                    chunksize=128
+                )
+            )
 
-        if hasattr(model, 'max_seq_length') and model.max_seq_length is not None:
-            is_seq_too_long = np.vectorize(lambda tokens: len(tokens) >= model.max_seq_length)
-            too_long = is_seq_too_long(inputs).sum(axis=0)
+            if self.show_progress_bar:
+                tokens_iter1 = tqdm(tokens_iter1, desc='Longest sequence searching')
+                tokens_iter2 = tqdm(tokens_iter2, desc='Pad sequences')
 
-        labels = [example.label for example in examples]
-        label_type = {int: torch.long, float: torch.float}.get(type(examples[0].label))
+            max_seq_len = self._get_max_seq_len(tokens_iter1, model)
 
-        tensor_labels = torch.tensor(labels, dtype=label_type)
+            padded_tokens = pool.imap(
+                func=partial(self._pad_sequences, pad_size=max_seq_len),
+                iterable=tokens_iter2,
+                chunksize=128
+            )
 
-        logging.info("Num sentences: %d" % (len(examples)))
-        for i in range(num_texts):
-            logging.info("Sentences {} longer than max_seqence_length: {}".format(i, too_long[i]))
+            labels = (example.label for example in examples_iter2)
 
-        self.tokens = inputs
-        self.labels = tensor_labels
+            dataset_h5_cache.parent.mkdir(parents=True, exist_ok=True)
 
-        self.CONVERTED_INPUTS_DUMP.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.tokens, self.CONVERTED_INPUTS_DUMP)
-        torch.save(self.labels, self.CONVERTED_LABELS_DUMP)
+            with tables.open_file(dataset_h5_cache, mode='w') as hf:
+                tokens_storage = hf.create_earray(hf.root, tokens_array,
+                                                  atom=tables.UInt16Atom(),
+                                                  shape=[0, 3, max_seq_len])
+
+                labels_storage = hf.create_earray(hf.root, labels_array,
+                                                  atom=tables.UInt8Atom(),
+                                                  shape=[0])
+
+                for padded_seq, label in tqdm(zip(padded_tokens, labels), desc='Writing'):
+                    tokens_storage.append([padded_seq])
+                    labels_storage.append([label])
+
+        self.read_h5_dataset(dataset_h5_cache, labels_array, tokens_array)
+
+    def read_h5_dataset(self, dataset_h5_cache, labels_array, tokens_array):
+        h5_file = tables.open_file(dataset_h5_cache, mode='r')
+
+        self.tokens = getattr(h5_file.root, tokens_array)
+        self.labels = getattr(h5_file.root, labels_array)
 
     @staticmethod
     def _convert_example(example: InputExample, model: SentenceTransformer):
         return [model.tokenize(text) for text in example.texts]
 
+    @staticmethod
+    def _get_max_seq_len(tokens: Iterable[List], model: SentenceTransformer):
+        max_seq_len = max(max(map(len, seqs)) for seqs in tokens)
+        model_max_seq_len = getattr(model, 'max_seq_length', sys.maxsize)
+        return min(max_seq_len, model_max_seq_len)
+
+    @staticmethod
+    def _pad_sequences(sequences, pad_size: int):
+        return [SentencesDataset._pad_array(seq, pad_size) for seq in sequences]
+
+    @staticmethod
+    def _pad_array(array: List, pad_size: int):
+        array = array[:pad_size]
+        return np.pad(array, pad_width=(0, pad_size - len(array)), mode='constant').tolist()
+
     def __getitem__(self, item):
-        return [self.tokens[i][item] for i in range(len(self.tokens))], self.labels[item]
+        label = self.labels[item]
+
+        if type(label) != torch.Tensor:
+            label = torch.tensor(label, dtype=self._label_type_mapping.get(type(label)))
+
+        return self.tokens[item].tolist(), label
 
     def __len__(self):
-        return len(self.tokens[0])
+        return self.tokens.shape[0]
 
 
 class SentenceLabelDataset(Dataset):

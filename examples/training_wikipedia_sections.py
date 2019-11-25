@@ -2,6 +2,7 @@ import argparse
 import csv
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import torch
 from torch.multiprocessing import set_start_method
@@ -24,6 +25,7 @@ def get_triplet_dataset(dataset_dir: str, csv_file: str, model: st.SentenceTrans
                                    quoting=csv.QUOTE_MINIMAL, has_header=True)
 
     return st.SentencesDataset(examples=triplet_reader.get_examples(csv_file, max_examples),
+                               dataset_cache_id=Path(csv_file).stem,
                                model=model)
 
 
@@ -98,11 +100,10 @@ def main():
               output_path=output_path,
               local_rank=args.local_rank)
 
-    del model
-    if torch.cuda.is_available():
+    if args.local_rank == 0 or not is_distributed:
+        del model
         torch.cuda.empty_cache()
 
-    if args.local_rank == 0 or not is_distributed:
         model = st.SentenceTransformer(output_path)
         test_data = get_triplet_dataset(dataset_path, 'test.csv', model)
         test_dataloader = get_data_loader(test_data, shuffle=False, batch_size=batch_size)
