@@ -56,12 +56,12 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    dataset_path = 'examples/datasets/iambot-wikipedia-sections-triplets'
+    dataset_path = 'examples/datasets/iambot-wikipedia-sections-triplets-all'
 
     output_path = 'output/bert-base-wikipedia-sections-mean-tokens-' + \
                   datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    batch_size = 16
+    batch_size = 17
     num_epochs = 1
 
     is_distributed = torch.cuda.device_count() > 1 and args.local_rank >= 0
@@ -83,8 +83,7 @@ def main():
     dev_dataloader = get_data_loader(
         dataset=get_triplet_dataset(dataset_path, 'validation.csv', model, 1000),
         shuffle=False,
-        batch_size=batch_size,
-        distributed=is_distributed
+        batch_size=batch_size
     )
     evaluator = TripletEvaluator(dev_dataloader)
 

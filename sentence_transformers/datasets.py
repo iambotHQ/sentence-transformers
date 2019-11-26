@@ -2,21 +2,21 @@
 This files contains various pytorch dataset classes, that provide
 data to the Transformer model
 """
+import bisect
+import logging
 import sys
 from functools import partial
-from itertools import tee
 from multiprocessing.pool import Pool
 from pathlib import Path
-
-import tables
-from torch.utils.data import Dataset
 from typing import List, Iterable
-from torch import Tensor
-import bisect
-import torch
-import logging
+
 import numpy as np
+import tables
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset
 from tqdm import tqdm
+
 from . import SentenceTransformer
 from .readers.InputExample import InputExample
 
@@ -29,17 +29,17 @@ class SentencesDataset(Dataset):
     SmartBatchingDataset does *not* work without it.
     """
     tokens: np.ndarray
-    labels: Tensor
+    labels: np.ndarray
 
     _label_type_mapping = {
         int: torch.long,
-        np.int64.__class__: torch.long,
-        np.uint8.__class__: torch.long,
+        np.int64: torch.long,
+        np.uint8: torch.long,
         float: torch.float,
     }
 
     def __init__(self, examples: Iterable[InputExample], model: SentenceTransformer,
-                 dataset_cache_id=None, show_progress_bar: bool = None):
+                 dataset_cache_id='ds', show_progress_bar: bool = None):
         """
         Create a new SentencesDataset with the tokenized texts and the labels as Tensor
         """
@@ -68,66 +68,67 @@ class SentencesDataset(Dataset):
         :return: a SmartBatchingDataset usable to train the model with SentenceTransformer.smart_batching_collate as the collate_fn
             for the DataLoader
         """
+        dataset_cache = cache_dir / dataset_cache_id / 'cache.h5'
 
-        dataset_h5_cache = cache_dir / dataset_cache_id / 'cache.h5'
-        tokens_array = 'tokens'
-        labels_array = 'labels'
-
-        if dataset_h5_cache.exists():
-            self.read_h5_dataset(dataset_h5_cache, labels_array, tokens_array)
+        if dataset_cache.exists():
+            self._read_h5_dataset(dataset_cache)
             return
 
-        examples_iter1, examples_iter2 = tee(examples)
-
-        if self.show_progress_bar:
-            examples_iter1 = tqdm(examples_iter1, desc='Convert dataset')
-            examples_iter2 = tqdm(examples_iter2, desc='Convert labels')
+        examples = list(examples)
+        examples_iter = tqdm(examples, desc='Convert dataset') \
+            if self.show_progress_bar else iter(examples)
 
         with Pool() as pool:
-            tokens_iter1, tokens_iter2 = tee(
-                pool.imap(
-                    func=partial(self._convert_example, model=model),
-                    iterable=examples_iter1,
-                    chunksize=128
-                )
-            )
+            tokens = pool.map(partial(self._convert_example, model=model), examples_iter)
 
-            if self.show_progress_bar:
-                tokens_iter1 = tqdm(tokens_iter1, desc='Longest sequence searching')
-                tokens_iter2 = tqdm(tokens_iter2, desc='Pad sequences')
+        if self.show_progress_bar:
+            tokens = tqdm(tokens, desc='Longest sequence searching')
 
-            max_seq_len = self._get_max_seq_len(tokens_iter1, model)
+        max_seq_len = SentencesDataset._get_max_seq_len(tokens, model)
+        SentencesDataset._write_h5_dataset(dataset_cache, examples, tokens, max_seq_len)
 
-            padded_tokens = pool.imap(
-                func=partial(self._pad_sequences, pad_size=max_seq_len),
-                iterable=tokens_iter2,
-                chunksize=128
-            )
+        self._read_h5_dataset(dataset_cache)
 
-            labels = (example.label for example in examples_iter2)
+    def _read_h5_dataset(self, dataset_path: Path):
+        h5_file = tables.open_file(dataset_path.as_posix(), mode='r')
 
-            dataset_h5_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.tokens = h5_file.root.tokens
+        self.labels = h5_file.root.labels
 
-            with tables.open_file(dataset_h5_cache, mode='w') as hf:
-                tokens_storage = hf.create_earray(hf.root, tokens_array,
-                                                  atom=tables.UInt16Atom(),
-                                                  shape=[0, 3, max_seq_len])
+    @staticmethod
+    def _write_h5_dataset(dataset_path: Path, examples: List[InputExample],
+                          tokens: List[List[List[int]]], max_seq_len: int):
+        dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
-                labels_storage = hf.create_earray(hf.root, labels_array,
-                                                  atom=tables.UInt8Atom(),
-                                                  shape=[0])
+        with tables.open_file(dataset_path.as_posix(), mode='w') as hf:
+            tokens_storage = hf.create_earray(hf.root, 'tokens',
+                                              atom=tables.UInt16Atom(),
+                                              shape=[0, 3, max_seq_len])
 
-                for padded_seq, label in tqdm(zip(padded_tokens, labels), desc='Writing'):
-                    tokens_storage.append([padded_seq])
-                    labels_storage.append([label])
+            labels_storage = hf.create_earray(hf.root, 'labels',
+                                              atom=tables.UInt8Atom(),
+                                              shape=[0])
 
-        self.read_h5_dataset(dataset_h5_cache, labels_array, tokens_array)
+            tokens_buffer, labels_buffer = [], []
 
-    def read_h5_dataset(self, dataset_h5_cache, labels_array, tokens_array):
-        h5_file = tables.open_file(dataset_h5_cache, mode='r')
+            for index, (seqs, example) in tqdm(
+                    iterable=enumerate(zip(tokens, examples)),
+                    desc='Writing',
+                    total=len(tokens)
+            ):
+                tokens_buffer.append(SentencesDataset._pad_sequences(seqs, max_seq_len))
+                labels_buffer.append(example.label)
 
-        self.tokens = getattr(h5_file.root, tokens_array)
-        self.labels = getattr(h5_file.root, labels_array)
+                if index % 20000 == 0:
+                    tokens_storage.append(tokens_buffer)
+                    labels_storage.append(labels_buffer)
+
+                    tokens_buffer.clear()
+                    labels_buffer.clear()
+
+            if len(tokens_buffer) > 0:
+                tokens_storage.append(tokens_buffer)
+                labels_storage.append(labels_buffer)
 
     @staticmethod
     def _convert_example(example: InputExample, model: SentenceTransformer):
