@@ -101,9 +101,10 @@ class SentencesDataset(Dataset):
         dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
         with tables.open_file(dataset_path.as_posix(), mode='w') as hf:
+            number_of_texts = len(examples[0].texts)
             tokens_storage = hf.create_earray(hf.root, 'tokens',
                                               atom=tables.UInt16Atom(),
-                                              shape=[0, 3, max_seq_len])
+                                              shape=[0, number_of_texts, max_seq_len])
 
             labels_storage = hf.create_earray(hf.root, 'labels',
                                               atom=tables.UInt8Atom(),
